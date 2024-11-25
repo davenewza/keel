@@ -9,7 +9,6 @@ import (
 	"github.com/samber/lo"
 	"github.com/teamkeel/keel/proto"
 	"github.com/teamkeel/keel/runtime/auth"
-	"github.com/teamkeel/keel/runtime/expressions"
 	"github.com/teamkeel/keel/schema/parser"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -43,7 +42,7 @@ func AuthoriseForActionType(scope *Scope, opType proto.ActionType, rowsToAuthori
 }
 
 // authorise checks authorisation for rows using the slice of permission rules provided.
-func authorise(scope *Scope, permissions []*proto.PermissionRule, input map[string]any, rowsToAuthorise []map[string]any) (authorised bool, err error) {
+func authorise(scope *Scope, permissions []*proto.PermissionRule, input map[string]any, rowsToAuthorise []map[string]any) (bool, error) {
 	ctx, span := tracer.Start(scope.Context, "Check permissions")
 	defer span.End()
 
@@ -56,8 +55,15 @@ func authorise(scope *Scope, permissions []*proto.PermissionRule, input map[stri
 		return false, nil
 	}
 
-	canResolve, authorised, _ := TryResolveAuthorisationEarly(scope, permissions)
-	if canResolve {
+	canAuthorise, authorised, err := TryAuthoriseByRolePermissions(scope, permissions)
+	if err != nil {
+		span.RecordError(err, trace.WithStackTrace(true))
+		span.SetStatus(codes.Error, err.Error())
+		return false, err
+	}
+
+	// If access can be concluded by role permissions alone
+	if canAuthorise {
 		return authorised, nil
 	}
 
@@ -102,53 +108,39 @@ func authorise(scope *Scope, permissions []*proto.PermissionRule, input map[stri
 	return authorised, nil
 }
 
-// TryResolveAuthorisationEarly will attempt to check authorisation early without row-based querying.
+// TryAuthoriseByRolePermissions will attempt to check authorisation early without row-based querying.
 // This will take into account logical conditions and multiple expression and role permission attributes.
-func TryResolveAuthorisationEarly(scope *Scope, permissions []*proto.PermissionRule) (canResolveAll bool, authorised bool, err error) {
-	hasDatabaseCheck := false
-	canResolveAll = false
+func TryAuthoriseByRolePermissions(scope *Scope, permissions []*proto.PermissionRule) (canAuthorise bool, authorised bool, err error) {
+	hasExpression := false
+
 	for _, permission := range permissions {
-		canResolve := false
-		authorised := false
 		switch {
 		case permission.Expression != nil:
-			expression, err := parser.ParseExpression(permission.Expression.Source)
-			if err != nil {
-				return false, false, err
-			}
-
-			// Try resolve the permission early.
-			canResolve, authorised = expressions.TryResolveExpressionEarly(scope.Context, scope.Schema, scope.Model, scope.Action, expression, map[string]any{})
-
-			if !canResolve {
-				hasDatabaseCheck = true
-			}
-
+			hasExpression = true
 		case permission.RoleNames != nil:
-			// Roles can always be resolved early.
-			canResolve = true
-
 			// Check if this role permission is satisfied.
-			authorised, err = resolveRolePermissionRule(scope.Context, scope.Schema, permission)
+			authorised, err := resolveRolePermissionRule(scope.Context, scope.Schema, permission)
 			if err != nil {
 				return false, false, err
 			}
-		}
 
-		// If this permission can be resolved now and is satisfied,
-		// then we know the permission will be granted because
-		// permission attributes are ORed.
-		if canResolve && authorised {
-			return true, true, nil
+			// If this permission is satisfied,
+			// then access is granted because
+			// permission attributes are ORed.
+			if authorised {
+				return true, true, nil
+			}
 		}
-
-		// If this permission can be resolved now and
-		// there hasn't been a row/db permission, then
-		// assume we can still resolve the entire action.
-		canResolveAll = canResolve && !hasDatabaseCheck
 	}
 
-	return canResolveAll, false, nil
+	// If there exists an expression attribute, then we can't conclusively deny access yet
+	if hasExpression {
+		return false, false, nil
+	}
+
+	// If there is no expression attribute, then we can conclude that access is denied
+	// because all role permissions failed
+	return true, false, nil
 }
 
 // resolveRolePermissionRule returns true if there is a role-based permission among the
@@ -217,14 +209,19 @@ func GeneratePermissionStatement(scope *Scope, permissions []*proto.PermissionRu
 
 	query.And()
 
-	// Filter by the ids we want to authorise
-	err := query.Where(IdField(), OneOf, Value(idsToAuthorise))
-	if err != nil {
-		return nil, err
-	}
+	if idsToAuthorise != nil {
+		// Filter by the ids we want to authorise
+		err := query.Where(IdField(), OneOf, Value(idsToAuthorise))
+		if err != nil {
+			return nil, err
+		}
 
-	// Check that the number of authorised rows matches
-	query.SelectClause(fmt.Sprintf("COUNT(DISTINCT %s) = %v AS authorised", IdField().toSqlOperandString(query), len(idsToAuthorise)))
+		// Check that the number of authorised rows matches
+		query.SelectClause(fmt.Sprintf("COUNT(DISTINCT %s) = %v AS authorised", IdField().toSqlOperandString(query), len(idsToAuthorise)))
+	} else {
+		query.SelectClause(fmt.Sprintf("COUNT(%s) > 0 AS authorised", IdField().toSqlOperandString(query)))
+
+	}
 
 	return query.SelectStatement(), nil
 }
